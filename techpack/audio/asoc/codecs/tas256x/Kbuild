@@ -57,24 +57,26 @@ UAPI_INC :=	-I$(AUDIO_ROOT)/include/$(UAPI_DIR)
 ############ COMMON ############
 COMMON_DIR :=	include
 COMMON_INC :=	-I$(AUDIO_ROOT)/$(COMMON_DIR)
-TFA_INC    :=   -I$(AUDIO_ROOT)/asoc/codecs/tfa98xx/inc
 
-# for TFA9874 Amplifer
-ifdef CONFIG_SND_SOC_TFA9874
-	TFA98XX_OBJS += src/tfa98xx.o
-	TFA98XX_OBJS += src/tfa_container.o
-	TFA98XX_OBJS += src/tfa_dsp.o
-	TFA98XX_OBJS += src/tfa_init.o
-	#TFA98XX_OBJS += src/tfa_debug.o
+############ TAS2562 ############
+
+# for TAS2562 Codec
+ifdef CONFIG_SND_SOC_TAS256X
+	TAS256X_OBJS := tas256x-codec.o tas256x-regmap.o tas256x.o
+endif
+# for TAS2562 Algo
+ifdef CONFIG_TAS25XX_ALGO
+	EXTRA_CFLAGS += -DCONFIG_TAS25XX_ALGO
+	TAS256X_OBJS += tas25xx-algo.o tas25xx-calib.o
 endif
 
-LINUX_INC += -Iinclude/linux
+LINUX_INC +=	-Iinclude/linux
 
-INCS +=	$(COMMON_INC) \
-	$(UAPI_INC) \
-	$(TFA_INC)
+INCS +=		$(COMMON_INC) \
+		$(UAPI_INC)
 
 EXTRA_CFLAGS += $(INCS)
+
 
 CDEFINES +=	-DANI_LITTLE_BYTE_ENDIAN \
 		-DANI_LITTLE_BIT_ENDIAN \
@@ -84,8 +86,7 @@ CDEFINES +=	-DANI_LITTLE_BYTE_ENDIAN \
 		-DPTT_SOCK_SVC_ENABLE \
 		-Wall\
 		-Werror\
-		-D__linux__ \
-		-DDEBUG
+		-D__linux__
 
 KBUILD_CPPFLAGS += $(CDEFINES)
 
@@ -111,5 +112,10 @@ KBUILD_EXTRA_SYMBOLS +=$(OUT)/obj/vendor/qcom/opensource/audio-kernel/soc/Module
 endif
 
 # Module information used by KBuild framework
-obj-$(CONFIG_SND_SOC_TFA9874)    += tfa98xx_dlkm.o
-tfa98xx_dlkm-y := $(TFA98XX_OBJS)
+obj-$(CONFIG_SND_SOC_TAS256X) += tas256x_dlkm.o
+tas256x_dlkm-y := $(TAS256X_OBJS)
+
+
+
+# inject some build related information
+DEFINES += -DBUILD_TIMESTAMP=\"$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')\"

@@ -2,7 +2,6 @@
  * cs35l41-i2c.c -- CS35l41 I2C driver
  *
  * Copyright 2017 Cirrus Logic, Inc.
- * Copyright (C) 2019 XiaoMi, Inc.
  *
  * Author:	David Rhodes	<david.rhodes@cirrus.com>
  *
@@ -31,7 +30,7 @@
 
 #include "wm_adsp.h"
 #include "cs35l41.h"
-#include <sound/cs35l41.h>
+#include <sound/cs35l41_v2.h>
 
 static struct regmap_config cs35l41_regmap_i2c = {
 	.reg_bits = 32,
@@ -66,7 +65,7 @@ static int cs35l41_i2c_probe(struct i2c_client *client,
 	int ret;
 
 
-	dev_info(dev, "cs35l41 i2c probe start\n");
+	dev_info(dev, "ZL: cs35l41 i2c probe start\n");
 
 	cs35l41 = devm_kzalloc(dev, sizeof(struct cs35l41_private), GFP_KERNEL);
 
@@ -87,6 +86,7 @@ static int cs35l41_i2c_probe(struct i2c_client *client,
 			ret);
 		return ret;
 	}
+	dev_info(dev, "ZL: before cs35l41 probe\n");
 
 	return cs35l41_probe(cs35l41, pdata);
 }
@@ -95,11 +95,7 @@ static int cs35l41_i2c_remove(struct i2c_client *client)
 {
 	struct cs35l41_private *cs35l41 = i2c_get_clientdata(client);
 
-	regmap_write(cs35l41->regmap, CS35L41_IRQ1_MASK1, 0xFFFFFFFF);
-	wm_adsp2_remove(&cs35l41->dsp);
-	regulator_bulk_disable(cs35l41->num_supplies, cs35l41->supplies);
-	snd_soc_unregister_codec(cs35l41->dev);
-	return 0;
+	return cs35l41_remove(cs35l41);
 }
 
 static const struct of_device_id cs35l41_of_match[] = {

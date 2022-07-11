@@ -41,6 +41,7 @@
 #include <linux/spi/spi.h>
 #include <linux/err.h>
 #include <linux/mfd/spk-id.h>
+#include <linux/firmware.h>
 
 #include "wm_adsp.h"
 #include "cs35l41.h"
@@ -221,13 +222,216 @@ static int vendor_id_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static const char *cs35l41_fast_switch_text[] = {
+	"fast_switch1.txt",
+	"fast_switch2.txt",
+	"fast_switch3.txt",
+	"fast_switch4.txt",
+	"fast_switch5.txt",
+};
+
+static int cs35l41_fast_switch_en_get(struct snd_kcontrol *kcontrol,
+				      struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
+
+	ucontrol->value.integer.value[0] = cs35l41->fast_switch_en;
+
+	return 0;
+}
+
+static int cs35l41_do_fast_switch(struct cs35l41_private *cs35l41)
+{
+	char			val_str[CS35L41_BUFSIZE];
+	const char		*fw_name;
+	const struct firmware	*fw;
+	int			ret;
+	unsigned int		i, j, k;
+	s32			data_ctl_len, val;
+	__be32			*data_ctl_buf, cmd_ctl, st_ctl;
+	bool			fw_running	= false;
+
+	data_ctl_buf	= NULL;
+
+	fw_name	= cs35l41->fast_switch_names[cs35l41->fast_switch_file_idx];
+	dev_dbg(cs35l41->dev, "fw_name:%s\n", fw_name);
+	ret	= request_firmware(&fw, fw_name, cs35l41->dev);
+	if (ret < 0) {
+		dev_err(cs35l41->dev, "Failed to request firmware:%s\n",
+			fw_name);
+		return -EIO;
+	}
+
+	/* Parse number of data in file */
+	for (i = 0, j = 0; (char)fw->data[i] != ','; i++) {
+		if ((char)fw->data[i] == ' ') {
+			/* Skip white space */
+		} else {
+			/* fw->data[i] must be numerical digit */
+			if (j < CS35L41_BUFSIZE - 1) {
+				val_str[j]	= fw->data[i];
+				j++;
+			} else {
+				dev_err(cs35l41->dev, "Invalid input\n");
+				ret		= -EINVAL;
+				goto exit;
+			}
+		}
+	}
+	i++;	/* points to beginning of next number */
+	val_str[j]	= '\0';
+	ret		= kstrtos32(val_str, 10, &data_ctl_len);
+	if (ret < 0) {
+		dev_err(cs35l41->dev, "kstrtos32 failed (%d) val_str:%s\n",
+			ret, val_str);
+		goto exit;
+	}
+
+	dev_dbg(cs35l41->dev, "data_ctl_len:%u\n", data_ctl_len);
+
+	data_ctl_buf	= kcalloc(1, data_ctl_len * sizeof(s32), GFP_KERNEL);
+	if (!data_ctl_buf) {
+		ret	= -ENOMEM;
+		goto exit;
+	}
+
+	data_ctl_buf[0]	= cpu_to_be32(data_ctl_len);
+
+	/* i continues from end of previous loop */
+	for (j = 0, k = 1; i <= fw->size; i++) {
+		if (i == fw->size || (char)fw->data[i] == ',') {
+			/*
+			 * Reached end of parameter
+			 * delimited either by ',' or end of file
+			 * Parse number and write parameter
+			 */
+			val_str[j]	= '\0';
+			ret		= kstrtos32(val_str, 10, &val);
+			if (ret < 0) {
+				dev_err(cs35l41->dev,
+					"kstrtos32 failed (%d) val_str:%s\n",
+					ret, val_str);
+				goto exit;
+			}
+			data_ctl_buf[k] = cpu_to_be32(val);
+			j		= 0;
+			k++;
+		} else if ((char)fw->data[i] == ' ') {
+			/* Skip white space */
+		} else {
+			/* fw->data[i] must be numerical digit */
+			if (j < CS35L41_BUFSIZE - 1) {
+				val_str[j] = fw->data[i];
+				j++;
+			} else {
+				dev_err(cs35l41->dev, "Invalid input\n");
+				ret	= -EINVAL;
+				goto exit;
+			}
+		}
+	}
+
+	wm_adsp_write_ctl(&cs35l41->dsp, "CSPL_UPDATE_PARAMS_CONFIG",
+			  data_ctl_buf, data_ctl_len * sizeof(s32));
+
+	dev_dbg(cs35l41->dev,
+		"Wrote %u reg for CSPL_UPDATE_PARAMS_CONFIG\n", data_ctl_len);
+
+#ifdef DEBUG
+	wm_adsp_read_ctl(&cs35l41->dsp, "CSPL_UPDATE_PARAMS_CONFIG",
+			 data_ctl_buf, data_ctl_len * sizeof(s32));
+	dev_dbg(cs35l41->dev, "read CSPL_UPDATE_PARAMS_CONFIG:\n");
+	for (i = 0; i < data_ctl_len; i++)
+		dev_dbg(cs35l41->dev, "%u\n", be32_to_cpu(data_ctl_buf[i]));
+#endif
+	cmd_ctl		= cpu_to_be32(CSPL_CMD_UPDATE_PARAM);
+	wm_adsp_write_ctl(&cs35l41->dsp, "CSPL_COMMAND", &cmd_ctl, sizeof(s32));
+
+	/* Verify CSPL COMMAND */
+	for (i = 0; i < 5; i++) {
+		wm_adsp_read_ctl(&cs35l41->dsp, "CSPL_STATE", &st_ctl,
+				 sizeof(s32));
+		if (be32_to_cpu(st_ctl) == CSPL_ST_RUNNING) {
+			dev_dbg(cs35l41->dev,
+				"CSPL STATE == RUNNING (%u attempt)\n", i);
+			fw_running	= true;
+			break;
+		}
+
+		usleep_range(100, 110);
+	}
+
+	if (!fw_running) {
+		dev_err(cs35l41->dev, "CSPL_STATE (%d) is not running\n",
+			st_ctl);
+		ret	= -1;
+		goto exit;
+	}
+exit:
+	kfree(data_ctl_buf);
+	release_firmware(fw);
+	return ret;
+}
+
+static int cs35l41_fast_switch_en_put(struct snd_kcontrol *kcontrol,
+				      struct snd_ctl_elem_value *ucontrol)
+{
+	int			ret = 0;
+
+	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
+
+	if (!cs35l41->fast_switch_en && ucontrol->value.integer.value[0])
+		/*
+		 * Rising on fast switch enable
+		 * Perform fast use case switching
+		 */
+		ret = cs35l41_do_fast_switch(cs35l41);
+
+	cs35l41->fast_switch_en = ucontrol->value.integer.value[0];
+
+	return ret;
+}
+
+static int cs35l41_fast_switch_file_put(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec	*codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private	*cs35l41 = snd_soc_codec_get_drvdata(codec);
+	struct soc_enum		*soc_enum;
+	unsigned int		i = ucontrol->value.enumerated.item[0];
+
+	soc_enum = (struct soc_enum *)kcontrol->private_value;
+
+	if (i >= soc_enum->items) {
+		dev_err(codec->dev, "Invalid mixer input (%u)\n", i);
+		return -EINVAL;
+	}
+
+	cs35l41->fast_switch_file_idx = i;
+
+	return 0;
+}
+
+static int cs35l41_fast_switch_file_get(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec	*codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private	*cs35l41 = snd_soc_codec_get_drvdata(codec);
+
+	ucontrol->value.enumerated.item[0] = cs35l41->fast_switch_file_idx;
+
+	return 0;
+}
+
 static const DECLARE_TLV_DB_RANGE(dig_vol_tlv,
 		0, 0, TLV_DB_SCALE_ITEM(TLV_DB_GAIN_MUTE, 0, 1),
-		1, 913, TLV_DB_SCALE_ITEM(-10200, 25, 0));
+		1, 913, TLV_DB_MINMAX_ITEM(-10200, 1200));
 static DECLARE_TLV_DB_SCALE(amp_gain_tlv, 0, 1, 1);
 
 static const struct snd_kcontrol_new dre_ctrl =
-	SOC_DAPM_SINGLE("Switch", CS35L41_PWR_CTRL3, 20, 1, 0);
+	SOC_DAPM_SINGLE("DRE Switch", CS35L41_PWR_CTRL3, 20, 1, 0);
 
 static const char * const cs35l41_pcm_sftramp_text[] =  {
 	"Off", ".5ms", "1ms", "2ms", "4ms", "8ms", "15ms", "30ms"};
@@ -236,20 +440,27 @@ static SOC_ENUM_SINGLE_DECL(pcm_sft_ramp,
 			    CS35L41_AMP_DIG_VOL_CTRL, 0,
 			    cs35l41_pcm_sftramp_text);
 
-static const char * const cs35l41_cspl_cmd_text[] = {
-	"CSPL_MBOX_CMD_RESUME",
-	"CSPL_MBOX_CMD_REINIT",
-	"CSPL_MBOX_CMD_STOP_PRE_REINIT",
-};
+static int cs35l41_reload_tuning_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
 
-static const unsigned int cs35l41_cspl_cmd_val[] = {
-	(unsigned int)CSPL_MBOX_CMD_RESUME,
-	(unsigned int)CSPL_MBOX_CMD_REINIT,
-	(unsigned int)CSPL_MBOX_CMD_STOP_PRE_REINIT,
-};
+	ucontrol->value.integer.value[0] = cs35l41->reload_tuning;
 
-static SOC_VALUE_ENUM_SINGLE_DECL(cs35l41_cspl_cmd, SND_SOC_NOPM, 0, 0,
-				  cs35l41_cspl_cmd_text, cs35l41_cspl_cmd_val);
+	return 0;
+}
+
+static int cs35l41_reload_tuning_put(struct snd_kcontrol *kcontrol,
+			   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
+	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
+
+	cs35l41->reload_tuning = ucontrol->value.integer.value[0];
+
+	return 0;
+}
 
 static bool cs35l41_is_csplmboxsts_correct(enum cs35l41_cspl_mboxcmd cmd,
 					   enum cs35l41_cspl_mboxstate sts)
@@ -274,8 +485,9 @@ static bool cs35l41_is_csplmboxsts_correct(enum cs35l41_cspl_mboxcmd cmd,
 static int cs35l41_set_csplmboxcmd(struct cs35l41_private *cs35l41,
 				   enum cs35l41_cspl_mboxcmd cmd)
 {
-	int		ret;
-	unsigned int	sts;
+	int		ret = 0;
+	unsigned int	sts, i;
+	bool		ack = false;
 
 	/* Reset DSP sticky bit */
 	regmap_write(cs35l41->regmap, CS35L41_IRQ2_STATUS2,
@@ -288,26 +500,36 @@ static int cs35l41_set_csplmboxcmd(struct cs35l41_private *cs35l41,
 	/*
 	 * Set mailbox cmd
 	 */
-	reinit_completion(&cs35l41->mbox_cmd);
 	/* Unmask DSP INT */
 	regmap_update_bits(cs35l41->regmap, CS35L41_IRQ2_MASK2,
 			   1 << CS35L41_CSPL_MBOX_CMD_DRV_SHIFT, 0);
-	/* Unmask AP INT */
-	regmap_update_bits(cs35l41->regmap, CS35L41_IRQ1_MASK2,
-			   1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT, 0);
 	regmap_write(cs35l41->regmap, CS35L41_CSPL_MBOX_CMD_DRV, cmd);
-	ret = wait_for_completion_timeout(&cs35l41->mbox_cmd,
-					  msecs_to_jiffies(CS35L41_MBOXWAIT));
-	if (ret == 0) {
+
+	/* Poll for DSP ACK */
+	for (i = 0; i < 5; i++) {
+		usleep_range(1000, 1010);
+		ret = regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS2, &sts);
+		if (ret < 0) {
+			dev_err(cs35l41->dev, "regmap_read failed (%d)\n", ret);
+			continue;
+		}
+		if (sts & (1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT)) {
+			dev_dbg(cs35l41->dev,
+				"%u: Received ACK in EINT for mbox cmd (%d)\n",
+				i, cmd);
+			regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS2,
+			     1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT);
+			ack = true;
+			break;
+		}
+	}
+
+	if (!ack) {
 		dev_err(cs35l41->dev,
 			"Timout waiting for DSP to set mbox cmd\n");
 		ret = -ETIMEDOUT;
 	}
 
-	/* Mask AP INT */
-	regmap_update_bits(cs35l41->regmap, CS35L41_IRQ1_MASK2,
-			   1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT,
-			   1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT);
 	/* Mask DSP INT */
 	regmap_update_bits(cs35l41->regmap, CS35L41_IRQ2_MASK2,
 			   1 << CS35L41_CSPL_MBOX_CMD_DRV_SHIFT,
@@ -330,53 +552,7 @@ static int cs35l41_set_csplmboxcmd(struct cs35l41_private *cs35l41,
 	return ret;
 }
 
-static int cs35l41_cspl_cmd_put(struct snd_kcontrol *kcontrol,
-				struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec	*codec =  snd_soc_kcontrol_codec(kcontrol);
-	struct cs35l41_private	*cs35l41 = snd_soc_codec_get_drvdata(codec);
-	struct soc_enum		*soc_enum;
-	unsigned int		i = ucontrol->value.enumerated.item[0];
 
-	soc_enum = (struct soc_enum *)kcontrol->private_value;
-
-	if (i >= soc_enum->items) {
-		dev_err(codec->dev, "Invalid mixer input (%u)\n", i);
-		return -EINVAL;
-	}
-
-	cs35l41->cspl_cmd = soc_enum->values[i];
-
-	return 0;
-}
-
-static int cs35l41_cspl_cmd_get(struct snd_kcontrol *kcontrol,
-				struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec	*codec = snd_soc_kcontrol_codec(kcontrol);
-	struct cs35l41_private	*cs35l41 = snd_soc_codec_get_drvdata(codec);
-	struct soc_enum		*soc_enum;
-	unsigned int		i;
-	int			ret = 0;
-
-	soc_enum = (struct soc_enum *)kcontrol->private_value;
-
-	for (i = 0; i < soc_enum->items; i++) {
-		if (cs35l41->cspl_cmd == soc_enum->values[i])
-			break;
-	}
-
-	if (i >= soc_enum->items) {
-		/* Cannot find value */
-		dev_err(cs35l41->dev, "Cannot find cspl cmd\n");
-		i = 0;
-		ret = -EINVAL;
-	}
-
-	ucontrol->value.enumerated.item[0] = i;
-
-	return ret;
-}
 static const char *virt_text[] = { "None", "Ref"};
 static SOC_ENUM_SINGLE_DECL(virt_enum,
 			    SND_SOC_NOPM, 2, virt_text);
@@ -485,12 +661,16 @@ static const struct snd_kcontrol_new cs35l41_aud_controls[] = {
 	SOC_SINGLE_RANGE("ASPRX2 Slot Position", CS35L41_SP_FRAME_RX_SLOT, 8,
 			 0, 7, 0),
 	SOC_ENUM("PCM Soft Ramp", pcm_sft_ramp),
-	SOC_VALUE_ENUM_EXT("CSPL Command", cs35l41_cspl_cmd,
-			   cs35l41_cspl_cmd_get, cs35l41_cspl_cmd_put),
 	SOC_SINGLE_EXT("DSP Booted", SND_SOC_NOPM, 0, 1, 0,
 			cs35l41_halo_booted_get, cs35l41_halo_booted_put),
+	SOC_SINGLE_EXT("Fast Use Case Switch Enable", SND_SOC_NOPM, 0, 1, 0,
+		       cs35l41_fast_switch_en_get, cs35l41_fast_switch_en_put),
+	SOC_SINGLE_EXT("Firmware Reload Tuning", SND_SOC_NOPM, 0, 1, 0,
+			cs35l41_reload_tuning_get, cs35l41_reload_tuning_put),
+	SOC_SINGLE("GLOBAL_EN from GPIO Control", CS35L41_PWR_CTRL1, 8, 1, 0),
 	WM_ADSP2_PRELOAD_SWITCH("DSP1", 1),
 	SOC_ENUM_EXT("SPK ID", vendor_id, vendor_id_get, NULL),
+
 };
 
 static const struct cs35l41_otp_map_element_t *cs35l41_find_otp_map(u32 otp_id)
@@ -647,24 +827,6 @@ static irqreturn_t cs35l41_irq(int irq, void *data)
 		!(status[2] & ~masks[2]) && !(status[3] & ~masks[3]))
 		return IRQ_NONE;
 
-	if (status[1] & (1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT)) {
-		regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS2,
-			     1 << CS35L41_CSPL_MBOX_CMD_FW_SHIFT);
-		complete(&cs35l41->mbox_cmd);
-	}
-
-	if (status[0] & CS35L41_PUP_DONE_MASK) {
-		regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS1,
-			     CS35L41_PUP_DONE_MASK);
-		complete(&cs35l41->global_pup_done);
-	}
-
-	if (status[0] & CS35L41_PDN_DONE_MASK) {
-		regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS1,
-			     CS35L41_PDN_DONE_MASK);
-		complete(&cs35l41->global_pdn_done);
-	}
-
 	/*
 	 * The following interrupts require a
 	 * protection release cycle to get the
@@ -789,8 +951,12 @@ static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
 {
 	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
 	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
+	enum cs35l41_cspl_mboxcmd mboxcmd = CSPL_MBOX_CMD_NONE;
 	int ret = 0;
-
+	enum cs35l41_cspl_mboxstate fw_status = CSPL_MBOX_STS_RUNNING;
+	int i;
+	bool pdn;
+	unsigned int val;
 	pr_debug("++++>CSPL: %s, event = %d.\n", __func__, event);
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
@@ -804,30 +970,66 @@ static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
 
 		usleep_range(1000, 1100);
 
-		if (cs35l41->halo_booted) {
-			if (cs35l41->cspl_cmd == CSPL_MBOX_CMD_STOP_PRE_REINIT)
-				/* Send this command on power down event */
-				ret = cs35l41_set_csplmboxcmd(cs35l41,
-							CSPL_MBOX_CMD_RESUME);
-			else
-				ret = cs35l41_set_csplmboxcmd(cs35l41,
-							cs35l41->cspl_cmd);
+		if (cs35l41->dsp.running) {
+			regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2,
+				(unsigned int *)&fw_status);
+			switch (fw_status) {
+			case CSPL_MBOX_STS_RDY_FOR_REINIT:
+				mboxcmd = CSPL_MBOX_CMD_REINIT;
+				break;
+			case CSPL_MBOX_STS_PAUSED:
+				mboxcmd = CSPL_MBOX_CMD_RESUME;
+				break;
+			case CSPL_MBOX_STS_RUNNING:
+				/*
+				 * First time playing audio
+				 * means fw_status is running
+				 */
+				mboxcmd = CSPL_MBOX_CMD_RESUME;
+				break;
+			default:
+				dev_err(cs35l41->dev,
+					"Firmware status is invalid(%u)\n",
+					fw_status);
+				break;
+			}
+			ret = cs35l41_set_csplmboxcmd(cs35l41, mboxcmd);
 		}
 		break;
 	case SND_SOC_DAPM_POST_PMD:
-		if (cs35l41->halo_booted) {
-			if (cs35l41->cspl_cmd == CSPL_MBOX_CMD_STOP_PRE_REINIT)
-				ret = cs35l41_set_csplmboxcmd(cs35l41,
-							cs35l41->cspl_cmd);
-			else
-				ret = cs35l41_set_csplmboxcmd(cs35l41,
-							CSPL_MBOX_CMD_PAUSE);
+		if (cs35l41->dsp.running) {
+			if (cs35l41->reload_tuning) {
+				mboxcmd = CSPL_MBOX_CMD_STOP_PRE_REINIT;
+				/*
+				 * Reset reload_tuning, so driver does not
+				 * continuously reload tuning file
+				 */
+				cs35l41->reload_tuning = false;
+			} else {
+				mboxcmd = CSPL_MBOX_CMD_PAUSE;
+			}
+			ret = cs35l41_set_csplmboxcmd(cs35l41, mboxcmd);
 		}
 
 		regmap_update_bits(cs35l41->regmap, CS35L41_PWR_CTRL1,
 				CS35L41_GLOBAL_EN_MASK, 0);
 
-		usleep_range(1000, 1100);
+		pdn = false;
+		for (i = 0; i < 100; i++) {
+			regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS1,
+				    &val);
+			if (val & CS35L41_PDN_DONE_MASK) {
+				pdn = true;
+				break;
+			}
+			usleep_range(1000, 1010);
+		}
+
+		if (!pdn)
+			dev_warn(cs35l41->dev, "PDN failed\n");
+
+		regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS1,
+			     CS35L41_PDN_DONE_MASK);
 
 		regmap_multi_reg_write_bypassed(cs35l41->regmap,
 					cs35l41_pdn_patch,
@@ -884,7 +1086,6 @@ static const struct snd_soc_dapm_widget cs35l41_dapm_widgets[] = {
 	SND_SOC_DAPM_MUX("DSP RX2 Source", SND_SOC_NOPM, 0, 0, &dsp_rx2_mux),
 	SND_SOC_DAPM_MUX("PCM Source", SND_SOC_NOPM, 0, 0, &pcm_source_mux),
 	SND_SOC_DAPM_SWITCH("DRE", SND_SOC_NOPM, 0, 0, &dre_ctrl),
-
 };
 
 static const struct snd_soc_dapm_route cs35l41_audio_map[] = {
@@ -963,7 +1164,7 @@ static const struct snd_soc_dapm_route cs35l41_audio_map[] = {
 
 	{"ASPRX1", NULL, "AMP Playback"},
 	{"ASPRX2", NULL, "AMP Playback"},
-	{"DRE", "Switch", "CLASS H"},
+	{"DRE", "DRE Switch", "CLASS H"},
 	{"Main AMP", NULL, "CLASS H"},
 	{"Main AMP", NULL, "DRE"},
 	{"SPK", NULL, "Main AMP"},
@@ -1106,6 +1307,8 @@ static int cs35l41_pcm_hw_params(struct snd_pcm_substream *substream,
 	asp_wl = params_width(params);
 	asp_width = params_physical_width(params);
 
+	cs35l41_codec_set_sysclk(dai->codec, 0, 0, 2 * rate * asp_width, 0);
+
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
 				CS35L41_ASP_WIDTH_RX_MASK,
@@ -1113,7 +1316,7 @@ static int cs35l41_pcm_hw_params(struct snd_pcm_substream *substream,
 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_RX_WL,
 				CS35L41_ASP_RX_WL_MASK,
 				asp_wl << CS35L41_ASP_RX_WL_SHIFT);
-		if (cs35l41->i2s_mode || cs35l41->dspa_mode) {
+		if (cs35l41->i2s_mode) {
 			regmap_update_bits(cs35l41->regmap,
 					CS35L41_SP_FRAME_RX_SLOT,
 					CS35L41_ASP_RX1_SLOT_MASK,
@@ -1166,11 +1369,11 @@ static int cs35l41_pcm_startup(struct snd_pcm_substream *substream,
 			       struct snd_soc_dai *dai)
 {
 
-	struct snd_soc_codec *codec = dai->codec;
+	//struct snd_soc_codec *codec = dai->codec;
 	pr_debug("++++>CSPL: %s.\n", __func__);
 
 	cs35l41_set_dai_fmt(dai, SND_SOC_DAIFMT_CBS_CFS|SND_SOC_DAIFMT_I2S);
-	cs35l41_codec_set_sysclk(codec, 0, 0, 1536000, 0);
+	//cs35l41_codec_set_sysclk(codec, 0, 0, 1536000, 0);
 #if 0
 	if (substream->runtime)
 		return snd_pcm_hw_constraint_list(substream->runtime, 0,
@@ -1251,16 +1454,34 @@ static int cs35l41_dai_set_sysclk(struct snd_soc_dai *dai,
 {
 	struct snd_soc_codec *codec = dai->codec;
 	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
-
+	unsigned int fs1_val = 0;
+	unsigned int fs2_val = 0;
+	unsigned int val;
 	pr_debug("++++>CSPL: %s: clk_id=%d, freq=%d, dir=%d\n", __func__, clk_id, freq, dir);
 	if (cs35l41_get_clk_config(freq) < 0) {
 		dev_err(codec->dev, "Invalid CLK Config freq: %u\n", freq);
 		return -EINVAL;
 	}
 
-	if (clk_id == CS35L41_PLLSRC_SCLK)
-		cs35l41->sclk = freq;
+	cs35l41->sclk = freq;
 	pr_debug("---->CSPL: %s.\n", __func__);
+	dev_dbg(cs35l41->dev, "Set DAI sysclk %d\n", freq);
+	if (cs35l41->sclk > 6000000) {
+		fs1_val = 3 * 4 + 4;
+		fs2_val = 8 * 4 + 4;
+	}
+	if (cs35l41->sclk <= 6000000) {
+		fs1_val = 3 * ((24000000 + cs35l41->sclk - 1) / cs35l41->sclk) + 4;
+		fs2_val = 5 * ((24000000 + cs35l41->sclk - 1) / cs35l41->sclk) + 4;
+	}
+
+	val = fs1_val;
+	val |= (fs2_val << CS35L41_FS2_WINDOW_SHIFT) & CS35L41_FS2_WINDOW_MASK;
+	regmap_write(cs35l41->regmap, CS35L41_TEST_KEY_CTL, 0x00000055);
+	regmap_write(cs35l41->regmap, CS35L41_TEST_KEY_CTL, 0x000000AA);
+	regmap_write(cs35l41->regmap, CS35L41_TST_FS_MON0, val);
+	regmap_write(cs35l41->regmap, CS35L41_TEST_KEY_CTL, 0x000000CC);
+	regmap_write(cs35l41->regmap, CS35L41_TEST_KEY_CTL, 0x00000033);
 
 	return 0;
 }
@@ -1388,6 +1609,7 @@ static int cs35l41_codec_probe(struct snd_soc_codec *codec)
 	struct cs35l41_private *cs35l41 = snd_soc_codec_get_drvdata(codec);
 	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
 	struct classh_cfg *classh = &cs35l41->pdata.classh_config;
+	struct snd_kcontrol_new	*kcontrol;
 	int ret;
 
 	/* Set Platform Data */
@@ -1533,7 +1755,27 @@ static int cs35l41_codec_probe(struct snd_soc_codec *codec)
 	snd_soc_dapm_ignore_suspend(dapm, "DSP1 Preloader");
 	snd_soc_dapm_ignore_suspend(dapm, "DSP1 Preload");
 
-	return 0;
+/* Add run-time mixer control for fast use case switch */
+	kcontrol = kzalloc(sizeof(*kcontrol), GFP_KERNEL);
+	if (!kcontrol) {
+		ret = -ENOMEM;
+		goto exit;
+	}
+
+	kcontrol->name	= "Fast Use Case Delta File";
+	kcontrol->iface = SNDRV_CTL_ELEM_IFACE_MIXER;
+	kcontrol->info	= snd_soc_info_enum_double;
+	kcontrol->get	= cs35l41_fast_switch_file_get;
+	kcontrol->put	= cs35l41_fast_switch_file_put;
+	kcontrol->private_value	= (unsigned long)&cs35l41->fast_switch_enum;
+	ret = snd_soc_add_codec_controls(codec, kcontrol, 1);
+	if (ret < 0)
+		dev_err(cs35l41->dev,
+			"snd_soc_add_codec_controls failed (%d)\n", ret);
+	kfree(kcontrol);
+exit:
+	return ret;
+
 }
 
 static int cs35l41_irq_gpio_config(struct cs35l41_private *cs35l41)
@@ -1629,37 +1871,106 @@ static struct snd_soc_dai_driver cs35l41_dai[] = {
 	},
 };
 
-
-
 static struct snd_soc_codec_driver soc_codec_dev_cs35l41 = {
 	.probe = cs35l41_codec_probe,
 	.remove = cs35l41_codec_remove,
+
 	.component_driver = {
 		.dapm_widgets = cs35l41_dapm_widgets,
 		.num_dapm_widgets = ARRAY_SIZE(cs35l41_dapm_widgets),
 		.dapm_routes = cs35l41_audio_map,
 		.num_dapm_routes = ARRAY_SIZE(cs35l41_audio_map),
+
 		.controls = cs35l41_aud_controls,
 		.num_controls = ARRAY_SIZE(cs35l41_aud_controls),
 	},
+
 	.set_sysclk = cs35l41_codec_set_sysclk,
 	.ignore_pmdown_time = false,
 	.idle_bias_off = true,
 };
 
+int spk_id_get(struct device_node *np)
+{
+	int id;
+	int state;
+
+	state = spk_id_get_pin_3state(np);
+	if (state < 0) {
+		pr_err("%s: Can not get id pin state, %d\n", __func__, state);
+		return VENDOR_ID_NONE;
+	}
+
+	switch (state) {
+	case PIN_PULL_DOWN:
+		id = VENDOR_ID_AAC;
+		break;
+	case PIN_PULL_UP:
+		id = VENDOR_ID_UNKNOWN;
+		break;
+	case PIN_FLOAT:
+		id = VENDOR_ID_GOER;
+		break;
+	default:
+		id = VENDOR_ID_UNKNOWN;
+		break;
+	}
+	return id;
+}
+
 static int cs35l41_handle_of_data(struct device *dev,
-				struct cs35l41_platform_data *pdata)
+				  struct cs35l41_platform_data *pdata,
+				  struct cs35l41_private *cs35l41)
 {
 	struct device_node *np = dev->of_node;
 	unsigned int val;
 	int ret;
+	size_t	num_fast_switch;
 	struct device_node *sub_node;
 	struct classh_cfg *classh_config = &pdata->classh_config;
 	struct irq_cfg *irq_gpio1_config = &pdata->irq_config1;
 	struct irq_cfg *irq_gpio2_config = &pdata->irq_config2;
+	unsigned int i;
 
 	if (!np)
 		return 0;
+
+	ret = of_property_count_strings(np, "cirrus,fast-switch");
+	if (ret < 0) {
+		/*
+		 * device tree do not provide file name.
+		 * Use default value
+		 */
+		num_fast_switch		= ARRAY_SIZE(cs35l41_fast_switch_text);
+		cs35l41->fast_switch_enum.items	=
+			ARRAY_SIZE(cs35l41_fast_switch_text);
+		cs35l41->fast_switch_enum.texts	= cs35l41_fast_switch_text;
+		cs35l41->fast_switch_names = cs35l41_fast_switch_text;
+	} else {
+		/* Device tree provides file name */
+		num_fast_switch			= (size_t)ret;
+		dev_info(dev, "num_fast_switch:%zu\n", num_fast_switch);
+		cs35l41->fast_switch_names =
+			devm_kmalloc(dev, num_fast_switch * sizeof(char *),
+				     GFP_KERNEL);
+		if (!cs35l41->fast_switch_names)
+			return -ENOMEM;
+		of_property_read_string_array(np, "cirrus,fast-switch",
+					      cs35l41->fast_switch_names,
+					      num_fast_switch);
+		for (i = 0; i < num_fast_switch; i++) {
+			dev_info(dev, "%d:%s\n", i,
+				 cs35l41->fast_switch_names[i]);
+		}
+		cs35l41->fast_switch_enum.items	= num_fast_switch;
+		cs35l41->fast_switch_enum.texts	= cs35l41->fast_switch_names;
+	}
+
+	cs35l41->fast_switch_enum.reg		= SND_SOC_NOPM;
+	cs35l41->fast_switch_enum.shift_l	= 0;
+	cs35l41->fast_switch_enum.shift_r	= 0;
+	cs35l41->fast_switch_enum.mask		=
+		roundup_pow_of_two(num_fast_switch) - 1;
 
 	pdata->right_channel = of_property_read_bool(np,
 					"cirrus,right-channel-amp");
@@ -1810,6 +2121,8 @@ static const struct reg_sequence cs35l41_reva0_errata_patch[] = {
 	{0x00000040,			0x0000AAAA},
 	{0x00003854,			0x05180240},
 	{CS35L41_VIMON_SPKMON_RESYNC,	0x00000000},
+	{0x00004310,			0x00000000},
+	{CS35L41_VPVBST_FS_SEL,		0x00000000},
 	{CS35L41_OTP_TRIM_30,		0x9091A1C8},
 	{0x00003014,			0x0200EE0E},
 	{CS35L41_BSTCVRT_DCM_CTRL,	0x00000051},
@@ -1818,7 +2131,7 @@ static const struct reg_sequence cs35l41_reva0_errata_patch[] = {
 	{CS35L41_IRQ2_DB3,		0x00000000},
 	{CS35L41_DSP1_YM_ACCEL_PL0_PRI,	0x00000000},
 	{CS35L41_DSP1_XM_ACCEL_PL0_PRI,	0x00000000},
-	{CS35L41_ASP_CONTROL4,		0x00000000},
+	{CS35L41_ASP_CONTROL4,		0x01010000},
 	{0x00000040,			0x0000CCCC},
 	{0x00000040,			0x00003333},
 };
@@ -1827,10 +2140,26 @@ static const struct reg_sequence cs35l41_revb0_errata_patch[] = {
 	{0x00000040,			0x00005555},
 	{0x00000040,			0x0000AAAA},
 	{CS35L41_VIMON_SPKMON_RESYNC,	0x00000000},
+	{0x00004310,			0x00000000},
+	{CS35L41_VPVBST_FS_SEL,		0x00000000},
 	{CS35L41_BSTCVRT_DCM_CTRL,	0x00000051},
 	{CS35L41_DSP1_YM_ACCEL_PL0_PRI,	0x00000000},
 	{CS35L41_DSP1_XM_ACCEL_PL0_PRI,	0x00000000},
-	{CS35L41_ASP_CONTROL4,		0x00000000},
+	{CS35L41_ASP_CONTROL4,		0x01010000},
+	{0x00000040,			0x0000CCCC},
+	{0x00000040,			0x00003333},
+};
+
+static const struct reg_sequence cs35l41_revb2_errata_patch[] = {
+	{0x00000040,			0x00005555},
+	{0x00000040,			0x0000AAAA},
+	{CS35L41_VIMON_SPKMON_RESYNC,	0x00000000},
+	{0x00004310,			0x00000000},
+	{CS35L41_VPVBST_FS_SEL,		0x00000000},
+	{CS35L41_BSTCVRT_DCM_CTRL,	0x00000051},
+	{CS35L41_DSP1_YM_ACCEL_PL0_PRI,	0x00000000},
+	{CS35L41_DSP1_XM_ACCEL_PL0_PRI,	0x00000000},
+	{CS35L41_ASP_CONTROL4,		0x01010000},
 	{0x00000040,			0x0000CCCC},
 	{0x00000040,			0x00003333},
 };
@@ -1838,7 +2167,7 @@ static const struct reg_sequence cs35l41_revb0_errata_patch[] = {
 static int cs35l41_dsp_init(struct cs35l41_private *cs35l41)
 {
 	struct wm_adsp *dsp;
-	int ret;
+	int ret, i;
 
 	dsp = &cs35l41->dsp;
 	dsp->part = "cs35l41";
@@ -1852,12 +2181,16 @@ static int cs35l41_dsp_init(struct cs35l41_private *cs35l41)
 	dsp->base_sysinfo = CS35L41_DSP1_SYS_ID;
 	dsp->mem = cs35l41_dsp1_regions;
 	dsp->num_mems = ARRAY_SIZE(cs35l41_dsp1_regions);
-	dsp->unlock_all = true;
 
-	dsp->n_rx_rates = CS35L41_DSP_N_RX_RATES;
-	dsp->n_tx_rates = CS35L41_DSP_N_TX_RATES;
-	ret = wm_halo_init(dsp);
+	dsp->n_rx_channels = CS35L41_DSP_N_RX_RATES;
+	dsp->n_tx_channels = CS35L41_DSP_N_TX_RATES;
+	ret = wm_halo_init(dsp, &cs35l41->rate_lock);
 	cs35l41->halo_booted = false;
+
+	for (i = 0; i < CS35L41_DSP_N_RX_RATES; i++)
+		dsp->rx_rate_cache[i] = 0x1;
+	for (i = 0; i < CS35L41_DSP_N_TX_RATES; i++)
+		dsp->tx_rate_cache[i] = 0x1;
 
 	regmap_write(cs35l41->regmap, CS35L41_DSP1_RX5_SRC,
 					CS35L41_INPUT_SRC_VPMON);
@@ -1879,10 +2212,9 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 	int timeout = 100;
 	int irq_pol = 0;
 
-	dev_info(cs35l41->dev, "cs35l41 proble\n" );
-
-	/* Default to RESUME cmd */
-	cs35l41->cspl_cmd = (unsigned int)CSPL_MBOX_CMD_RESUME;
+	cs35l41->fast_switch_en = false;
+	cs35l41->fast_switch_file_idx = 0;
+	cs35l41->reload_tuning = false;
 
 	for (i = 0; i < ARRAY_SIZE(cs35l41_supplies); i++)
 		cs35l41->supplies[i].supply = cs35l41_supplies[i];
@@ -1901,7 +2233,8 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 	if (pdata) {
 		cs35l41->pdata = *pdata;
 	} else if (cs35l41->dev->of_node) {
-		ret = cs35l41_handle_of_data(cs35l41->dev, &cs35l41->pdata);
+		ret = cs35l41_handle_of_data(cs35l41->dev, &cs35l41->pdata,
+					     cs35l41);
 		if (ret != 0)
 			return ret;
 	} else {
@@ -1984,11 +2317,6 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 
 	irq_pol = cs35l41_irq_gpio_config(cs35l41);
 
-	init_completion(&cs35l41->global_pdn_done);
-	init_completion(&cs35l41->global_pup_done);
-
-	init_completion(&cs35l41->mbox_cmd);
-
 	ret = devm_request_threaded_irq(cs35l41->dev, cs35l41->irq, NULL,
 				cs35l41_irq, irq_pol | IRQF_ONESHOT,
 				"cs35l41", cs35l41);
@@ -2024,6 +2352,16 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 			goto err;
 		}
 		break;
+	case CS35L41_REVID_B2:
+		ret = regmap_multi_reg_write(cs35l41->regmap,
+				cs35l41_revb2_errata_patch,
+				ARRAY_SIZE(cs35l41_revb2_errata_patch));
+		if (ret < 0) {
+			dev_err(cs35l41->dev,
+				"Failed to apply B2 errata patch %d\n", ret);
+			goto err;
+		}
+		break;
 	}
 
 	ret = cs35l41_otp_unpack(cs35l41);
@@ -2032,6 +2370,8 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 		goto err;
 	}
 
+	regmap_write(cs35l41->regmap,
+			CS35L41_DSP1_CCM_CORE_CTRL, 0);
 	cs35l41_dsp_init(cs35l41);
 
 	ret =  snd_soc_register_codec(cs35l41->dev, &soc_codec_dev_cs35l41,
@@ -2043,6 +2383,8 @@ int cs35l41_probe(struct cs35l41_private *cs35l41,
 
 	dev_info(cs35l41->dev, "Cirrus Logic CS35L41 (%x), Revision: %02X\n",
 			regid, reg_revid);
+
+	return 0;
 
 err:
 	regulator_bulk_disable(cs35l41->num_supplies, cs35l41->supplies);
