@@ -40,7 +40,6 @@ static struct regmap_config cs35l41_regmap_spi = {
 	.num_reg_defaults = ARRAY_SIZE(cs35l41_reg),
 	.volatile_reg = cs35l41_volatile_reg,
 	.readable_reg = cs35l41_readable_reg,
-	.precious_reg = cs35l41_precious_reg,
 	.cache_type = REGCACHE_RBTREE,
 };
 
@@ -65,8 +64,6 @@ static int cs35l41_spi_probe(struct spi_device *spi)
 			       GFP_KERNEL);
 	if (cs35l41 == NULL)
 		return -ENOMEM;
-
-	mutex_init(&cs35l41->rate_lock);
 
 	spi_set_drvdata(spi, cs35l41);
 	cs35l41->regmap = devm_regmap_init_spi(spi, regmap_config);
